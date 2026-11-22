@@ -8,6 +8,54 @@
 
 import * as ratmod from 'wwand.codec.schema.rat';
 
+// ML352_AFL-V1 readback (LT22M, 2026): SVC fields 5/6/8 are PCI/DL
+// EARFCN/band, fields 10/11 track RSRP/RSRQ report indices. Independently
+// checked against BANDIND B7, CEREG ECI and CESQ indices (off by at most
+// one RSRP step). Encoding remains unverified: keep them RAW, not dBm/dB.
+// Field 1 looked like 610 on a 26201 network: NOT a PLMN.
+// The Air720 v4.2.2 pp.96-97 engineering schema diverges past field 8;
+// never infer unknown identifiers from the rest of the long SVC row.
+export function parse_ml352_eemginfo(lines)
+{
+	let serving = null, neigh = { intra: [], inter: [] };
+	for (let l in (lines ?? [])) {
+		let s = match(l, /^\+EEMLTESVC:\s*(.*)$/);
+		if (s) {
+			let a = map(split(s[1], ','), (v) => trim(v));
+			if (length(a) < 11 || !match(a[4], /^[0-9]+$/) ||
+			    !match(a[5], /^[0-9]+$/) || !match(a[7], /^[0-9]+$/))
+				continue;
+			let pci = +a[4], earfcn = +a[5];
+			if (pci > 503 || !earfcn || earfcn > 262143)
+				continue;
+			serving = { lte: { pci: pci, earfcn: earfcn, band: +a[7],
+				rsrp: null, rsrq: null,
+				rsrp_index: match(a[9], /^[0-9]+$/) ? +a[9] : null,
+				rsrq_index: match(a[10], /^[0-9]+$/) ? +a[10] : null,
+				metric_encoding: 'raw_eem_index' } };
+			continue;
+		}
+		let m = match(l, /^\+EEMLTE(INTRA|INTER):\s*([0-9]+)\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*,\s*(-?[0-9]+)\s*,\s*(-?[0-9]+)\s*$/);
+		if (!m)
+			continue;
+		let pci = +m[3], earfcn = +m[4];
+		if (pci > 503 || earfcn > 262143 || !earfcn)
+			continue;
+		let c = { pci: pci, earfcn: earfcn, rsrp: null, rsrq: null,
+			rssi: null, srxlev: null, rsrp_index: +m[5], rsrq_index: +m[6],
+			metric_encoding: 'raw_eem_index' };
+		if (m[1] == 'INTRA')
+			push(neigh.intra, c);
+		else
+			push(neigh.inter, c);
+	}
+	if (!serving)
+		return null;
+	neigh.intra = filter(neigh.intra, (c) => c.earfcn == serving.lte.earfcn);
+	neigh.inter = filter(neigh.inter, (c) => c.earfcn != serving.lte.earfcn);
+	return { serving: serving, neigh: neigh };
+};
+
 // parse an AT+QNWLOCK read response into the lock state. Quectel formats:
 //   +QNWLOCK: "common/4g",<num_of_cells>[,<earfcn>,<pci>[,...]]
 //   +QNWLOCK: "common/4g_ext",<num_of_cells>[,<cell_list>]

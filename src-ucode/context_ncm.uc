@@ -359,7 +359,7 @@ export function create(opts)
 	// than asking the question again.
 	let read_rdp_once = (cb) => {
 		// THE VENDOR BRANCH NEEDS THE SAME GUARD. It dereferences modem.at
-		// itself (ncm_vendors.uc:1422, :1666 and friends) instead of going
+		// itself (ncm_vendors.uc:1575, :1666 and friends) instead of going
 		// through at_send, and the NCM teardown nulls modem.at without
 		// notifying the contexts — so an ACTIVATING context whose retry fires a
 		// second later used to call `.send` on null. A throw inside a uloop
@@ -831,7 +831,7 @@ export function create(opts)
 				if (self.state != 'ACTIVATING')
 					return;
 
-				at_send(dial.connect(self.cid, ccfg), (err) => {
+				let send_connect = () => at_send(dial.connect(self.cid, ccfg), (err) => {
 					if (self.state != 'ACTIVATING')
 						return;
 
@@ -841,7 +841,7 @@ export function create(opts)
 					// some modems auto-dial (or keep a previous bearer) and reject a
 					// dial while it is up (MeiG ECMDUP returns bare ERROR) — probe the
 					// dial status and adopt the live session instead of failing
-					if (dial.status && dial.status_state) {
+					if (dial.status && dial.status_state && dial.status_is_binding !== false) {
 						return at_send(dial.status, (serr, sres) => {
 							if (self.state != 'ACTIVATING')
 								return;
@@ -858,6 +858,34 @@ export function create(opts)
 
 					self._fail({ stage: 'connect', err: err });
 				}, { timeout: 60000 });
+
+				// ML352 needs an active PDP before *NETACT binds RNDIS. A single
+				// `connect` command cannot express that order; never infer RNDIS
+				// readiness from the CGACT reply alone (ML352_AFL-V1, 2026-11-16).
+				let pre = dial.pre_connect ? dial.pre_connect(self.cid, ccfg) : null;
+				let run_pre_connect = () => at_send(pre, (err) => {
+					if (self.state != 'ACTIVATING')
+						return;
+					if (err)
+						return self._fail({ stage: 'pre_connect', err: err });
+					send_connect();
+				}, { timeout: 60000 });
+
+				// ML352_AFL-V1 rejects a second CGACT=1 with CME even though the
+				// PDP is active (field-observed 2026-11-22). Only this dial opts in:
+				// CGACT? proves PDP state, not that *NETACT has bound RNDIS.
+				if (pre && dial.pre_connect_status && dial.status && dial.status_state)
+					at_send(dial.status, (err, res) => {
+						if (self.state != 'ACTIVATING')
+							return;
+						if (!err && dial.status_state(res?.lines, self.cid) === 1)
+							return send_connect();
+						run_pre_connect(); // unknown/down/error: retain existing activation
+						}, { timeout: 8000 });
+				else if (pre)
+					run_pre_connect();
+				else
+					send_connect();
 				});
 			});
 		};

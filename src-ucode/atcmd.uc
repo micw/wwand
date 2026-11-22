@@ -287,6 +287,7 @@ export function cell_lock_commands(cfg)
 
 // vendor response parsers moved to atcmd_parse.uc — re-exported so the
 // existing `atcmd.parse_*` consumers (modem backends, tests) are unchanged
+export const parse_ml352_eemginfo = parse.parse_ml352_eemginfo;
 export const parse_qnwlock = parse.parse_qnwlock;
 export const parse_qcainfo = parse.parse_qcainfo;
 export const parse_qeng_servingcell = parse.parse_qeng_servingcell;

@@ -739,7 +739,7 @@ config interface 'wan'
 	option clat ''                   # QMI: profile flag "CLAT Enabled" (464XLAT in
 	                                 #   the modem), same tri-state, IPv6 bearers only;
 	                                 #   on with pdp_type ipv6 it also starts IPv4
-	option address_allocation ''     # QMI + NCM: profile preference nas|dhcp, unset = leave it
+	option address_allocation ''     # QMI + NCM: modem profile preference nas|dhcp, unset = leave it
 	option ims ''                    # QMI: this PDN is the IMS one — profile flags "PCSCF
 	                                 #   Address Using PCO" + "IMCN Flag", P-CSCF in the status
 	option metric '10'               # metric / peerdns / defaultroute / ip4table /

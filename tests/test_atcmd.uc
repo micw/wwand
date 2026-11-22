@@ -11,6 +11,27 @@ uloop.init();
 
 const silent = (level, msg) => null;
 
+let eem = atcmd.parse_ml352_eemginfo([
+	'+EEMLTESVC: 610,2,1,16545,312,3050,21050,7,5,44,14,18,2',
+	'+EEMLTEINTER: 0,197,1444,57,24',
+	'+EEMLTEINTER: 1,65535,3749,0,0',
+	'+EEMLTEINTRA: 0,313,3050,32,0',
+	'+EEMLTEINTRA: 1,314,1444,33,4',
+]);
+eq(eem?.serving?.lte?.pci, 312, 'EEM serving PCI field 5');
+eq(eem?.serving?.lte?.earfcn, 3050, 'EEM serving DL EARFCN field 6');
+eq(eem?.serving?.lte?.rsrp, null, 'EEM unknown metric encoding never invents dBm');
+eq(eem?.serving?.lte?.rsrp_index, 44, 'EEM serving RSRP source index retained');
+eq(eem?.serving?.lte?.rsrq_index, 14, 'EEM serving RSRQ source index retained');
+eq(eem?.serving?.lte?.metric_encoding, 'raw_eem_index', 'EEM index provenance explicit');
+eq(eem?.neigh?.inter[0]?.pci, 197, 'EEM inter-frequency neighbour PCI');
+eq(eem?.neigh?.inter[0]?.rsrp, null, 'EEM neighbour report index is not a verified dBm value');
+eq(eem?.neigh?.inter[0]?.rsrp_index, 57, 'EEM neighbour raw RSRP index preserved');
+eq(length(eem?.neigh?.inter), 1, 'EEM invalid PCI 65535 ignored');
+eq(length(eem?.neigh?.intra), 1, 'EEM inconsistent intra-frequency row ignored');
+eq(atcmd.parse_ml352_eemginfo([ '+EEMLTEINTER: 0,197,1444,57,24' ]), null,
+	'EEM neighbour without serving does not publish invented serving cell');
+
 // --- fake transport ----------------------------------------------------------
 
 function fake_transport()

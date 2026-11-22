@@ -1464,7 +1464,7 @@ export function at_retired(self, ...cmds)
 // A BARE `ERROR` retires a command. `+CME ERROR: <n>` never does: it is a
 // runtime condition (SIM not ready, no network) that says nothing about whether
 // the firmware knows the command. atcmd already separates the three
-// (atcmd.uc:1146 vs :1147 vs :1091).
+// (atcmd.uc:1147 vs :1147 vs :1091).
 //
 // A TIMEOUT retires one only when the PORT IS PROVABLY ALIVE. On its own a
 // timeout means the port is wedged or the modem busy — then every command goes
@@ -2794,7 +2794,7 @@ export function at_late_retry(self, o)
 // of them is not in the unit its name suggests: WCDMA Ec/Io is a raw gint16 in
 // units of -0.5 dB, which libqmi renders as (-0.5)*raw before printing it
 // (qmicli-nas.c:460-462, libqmi 1.38.0) — a raw 20 means -10.0 dB, and the sign
-// flips too. The AT path already reports real dB (atcmd_parse.uc:433), so a raw
+// flips too. The AT path already reports real dB (atcmd_parse.uc:481), so a raw
 // value left in place makes one documented key mean two different things
 // depending on which path answered, with nothing at the consumer able to tell.
 //

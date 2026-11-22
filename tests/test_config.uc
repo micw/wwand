@@ -1907,4 +1907,21 @@ eq(length(filter(psim.warnings, (w) => index(w, "unknown option 'pdp_type'") >= 
 	eq(length(filter(c.warnings, (w) => index(w, 'both auto') >= 0)), 0, 'iccid: ...not when one is auto 0');
 }
 
+// The LT22M ML352 policies are opt-in; otherwise a modem reset or an AT*BAND
+// write would silently change persistent radio settings on unrelated boards.
+let mlpol = config.parse({ network: {
+	m0: { '.type': 'wwand_modem', device: 'eth1', protocol: 'ncm',
+		ml352_hotswap: '1', ml352_auto_dial: '1', ml352_roaming: '0' },
+	lte: { '.type': 'interface', proto: 'wwand', modem: 'm0', pdp_type: 'ipv4' },
+} });
+eq([ mlpol.modems.m0.ml352_hotswap, mlpol.modems.m0.ml352_auto_dial,
+	mlpol.modems.m0.ml352_roaming ], [ true, true, false ],
+	'ml352: SIM detect, auto dial and roaming choices survive UCI parsing');
+eq(length(filter(mlpol.warnings, (w) => match(w, /unknown option 'ml352_/))), 0,
+	'ml352: policy keys are known to the parser');
+let default_modem = config.modem_defaults();
+eq([ default_modem.ml352_hotswap, default_modem.ml352_auto_dial,
+	default_modem.ml352_roaming ], [ null, null, null ],
+	'ml352: generic defaults never write persistent ASR settings');
+
 done('test_config');

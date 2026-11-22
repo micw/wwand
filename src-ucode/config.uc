@@ -278,6 +278,8 @@ export function modem_defaults(over)
 		mux: 'auto', dl_datagram_max_size: 0, tty: null,
 		diag_port: null,       // explicit DM/DIAG node for wwand-qlog (never opened)
 		at_init: [], location: false, delay: 0,
+		// Board-specific ML352 policy: never alter persistent modem settings by default.
+		ml352_hotswap: null, ml352_auto_dial: null, ml352_roaming: null,
 		at2_external: false,   // release the secondary AT port for external tools
 		gnss: false,           // switch the modem's GNSS receiver on (NMEA port)
 		gnss_nmea: null,       // 'fix' | 'full': the NMEA the receiver emits (null = untouched)
@@ -423,7 +425,9 @@ function apply_globals(s, result)
 const MODEM_KNOWN_OPTS = [ 'protocol', 'device', 'netdev', 'path', 'usb_path', 'serial',
 	'imei', 'repower_time', 'reset_gpio', 'reset_fallback', 'sim_detect', 'nr5g_mode', 'recovery_steps', 'pincode', 'modes', 'rat_order', 'mcc', 'mnc',
 	'mux', 'dl_datagram_max_size', 'tty', 'diag_port', 'at2_external', 'gnss', 'gnss_set_time', 'nitz_time', 'fcc_auth',
-	'gnss_nmea', 'at_init', 'location', 'delay', 'failreboot', 'proto_error_limit',
+	'gnss_nmea', 'at_init', 'location', 'delay',
+	'ml352_hotswap', 'ml352_auto_dial', 'ml352_roaming',
+	'failreboot', 'proto_error_limit',
 	'unarmed_reset_after', 'card_hold', 'ipa_mode',
 	'zero_rx_timeout', 'tx_stall_timeout', 'bearer_poll_count', 'lock_4g', 'lock_5g', 'lock_persist', 'sim_slot',
 	'stats_interval', 'auto_correct_config', 'plmn_list',
@@ -634,6 +638,9 @@ function modem_from_section(s, warnings)
 		ipa_mode: ipa_mode_opt(s.ipa_mode, warnings),
 		at_init: (type(s.at_init) == 'array') ? s.at_init :
 		         (s.at_init != null ? [ s.at_init ] : []),
+		ml352_hotswap: s.ml352_hotswap == null ? null : bool_opt(s.ml352_hotswap, false),
+		ml352_auto_dial: s.ml352_auto_dial == null ? null : bool_opt(s.ml352_auto_dial, false),
+		ml352_roaming: s.ml352_roaming == null ? null : bool_opt(s.ml352_roaming, false),
 		location: bool_opt(s.location, false),
 		delay: num_opt(s.delay, 0, 'delay', warnings),
 		failreboot: num_opt(s.failreboot, 100, 'failreboot', warnings),

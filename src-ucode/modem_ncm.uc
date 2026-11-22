@@ -1583,8 +1583,11 @@ export function create(opts)
 		self.set_state('CONFIGURING');
 
 		let cfg = attach_cfg();
-		// one-time vendor init (e.g. CFUN=1) + the attach context definition/auth
-		let cmds = [ ...(self.vendor.modem_init ?? []), ...build_pdp_setup(self.vendor, 1, cfg) ];
+		// A board-verified ML352 may need a read-before-write SIM polarity
+		// change; only an acknowledged change requires the modem reset.
+		let vendor_init = (type(self.vendor.modem_init) == 'function')
+			? self.vendor.modem_init(self.config) : (self.vendor.modem_init ?? []);
+		let cmds = [ ...vendor_init, ...build_pdp_setup(self.vendor, 1, cfg) ];
 
 		if (!length(cmds))
 			return step_register();
@@ -1616,9 +1619,14 @@ export function create(opts)
 			let changed = configured &&
 				!ncm_vendors.pdp_setup_matches(1, cfg, rres?.lines);
 
-			attach_at.run_sequence(cmds, () => {
+			attach_at.run_sequence(cmds, (changed_settings) => {
 				if (gone())
 					return;
+				if (length(filter(changed_settings ?? [], (s) => s.reset))) {
+					if (self.at_init_changed)
+						return self.at_init_changed(changed_settings);
+					return fail('modem_setting_requires_reset');
+				}
 
 				// the PD flag rides the same re-attach: context 1's bearer comes
 				// up at attach, before any dial (QMI parity: ensure_attach_profile)
@@ -1645,10 +1653,22 @@ export function create(opts)
 	// registration: poll CEREG (LTE/5G) then CREG (fallback) until the modem is
 	// registered home/roaming or the timeout elapses.
 	step_register = () => {
-		// before registering: debug-dump + restore the configured preferred list
-		// (NCM has no NAS — a 'nas' list errors and is logged; a 'user' list goes
-		// out over AT+CPOL). Best-effort, never blocks bring-up.
-		sim.log_preradio(self, log, () => sim.restore_preferred_plmn(self, log, () => step_register_go()));
+		let proceed = () => {
+			if (!self.at || self.state == 'ABSENT')
+				return;
+			sim.log_preradio(self, log,
+				() => sim.restore_preferred_plmn(self, log, () => step_register_go()));
+		};
+		if (!self.vendor.configure_roaming || !self.at)
+			return proceed();
+		self.vendor.configure_roaming(self, (err, changed) => {
+			if (err)
+				log('warn', sprintf('ML352 roaming configuration could not be verified: %J', err));
+			if (changed)
+				settle_timer = uloop.timer(self.timing.settle, proceed);
+			else
+				proceed();
+		});
 	};
 
 	step_register_go = () => {
@@ -1677,7 +1697,7 @@ export function create(opts)
 
 				let r = err ? null : parse_creg(res?.lines);
 
-				let after = (rr) => {
+				let after_poll = (rr) => {
 					poll_inflight = false;
 
 					if (rr?.registered)
@@ -1704,6 +1724,20 @@ export function create(opts)
 					}
 				};
 
+				let after = (rr) => {
+					if (rr?.registered || !self.vendor.sim_presence ||
+					    self.state != 'REGISTERING' || !self.at)
+						return after_poll(rr);
+					self.vendor.sim_presence(self, (present) => {
+						if (self.state != 'REGISTERING' || !self.at) {
+							poll_inflight = false;
+							return;
+						}
+						if (present != null)
+							self.ml352_sim_present = present;
+						after_poll(rr);
+					});
+				};
 				if (r?.registered)
 					return after(r);
 
@@ -1825,6 +1859,8 @@ export function create(opts)
 		if (reg_poll_timer) { reg_poll_timer.cancel(); reg_poll_timer = null; }
 
 		self.reg = { registration: 1, roaming: r.roaming };
+		if (self.vendor.sim_presence)
+			self.ml352_sim_present = true;
 		self.reg_detail = null;   // registered: clear any stale reject info
 		self.counters.attempts = 0;
 

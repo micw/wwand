@@ -382,6 +382,24 @@ export const DIAL_CGACT = {
 	},
 };
 
+// ML352_AFL-V1 on the LT22M: a live CID-1 PDP is NOT enough to bind the
+// RNDIS ethernet interface. AT*NETACT=1,<cid>,1 does so after CGACT=1,<cid>;
+// AT*NETACT? answers bare OK (no state). HW-observed 2026-11-16 on ML352_AFL-V1.
+// Check CGACT? for PDP liveness; the zero-rx watchdog handles a silent RNDIS.
+const DIAL_ML352_NETACT = {
+	name: 'ml352_netact',
+	probe: 'AT*NETACT=?',
+	pre_connect: (cid) => sprintf('AT+CGACT=1,%d', cid),
+	// On ML352_AFL-V1, repeating CGACT=1 for an already active CID returns CME;
+	// CGACT? is authoritative for PDP activation, not for RNDIS binding.
+	pre_connect_status: true,
+	connect: (cid) => sprintf('AT*NETACT=1,%d,1', cid),
+	disconnect: (cid) => sprintf('AT*NETACT=0,%d,1', cid),
+	status: DIAL_CGACT.status,
+	status_state: DIAL_CGACT.status_state,
+	status_is_binding: false, // CGACT? cannot confirm *NETACT bound RNDIS
+};
+
 // Quectel QNETDEVCTL (older/LTE Quectel; NOT the RG5xx/SDX 5G modems).
 //   AT+QNETDEVCTL=<op>,<cid>,<urc>  (op 1=connect, 0=disconnect)
 //   AT+QNETDEVCTL? -> +QNETDEVCTL: <op>,<cid>,<urc>,<state> (state 1=bound)
@@ -1195,6 +1213,144 @@ export const VENDORS = {
 		},
 	},
 
+	// ML352/ASR on the LT22M (local ml352d/ml352d: CID 1 CGDCONT IP,
+	// CGACT?/CGPADDR, RNDIS eth1, control AT ttyUSB1). The board supervisor
+	// observed the CGPADDR IPv4 equal to the host's DHCP lease; that does NOT
+	// supply a gateway, DNS, or a general DHCP contract for other compositions.
+	// Never send persistent *BAND=, HOSCFG= or DIALMODE= blindly: the
+	// opt-in policy uses read-before-write, and HOSCFG needs one reset after
+	// a verified change. The modem's band masks must be preserved.
+	ml352: {
+		match: null,   // selected by exact model family below, not every ASR die
+		// AT+HOSCFG takes effect after a full modem reset. The core's AT
+		// setting steps check and verify read-back before ever writing, and
+		// report the one required reset through at_init_changed. Only select
+		// this when the board's SIM-detect polarity has been established.
+		modem_init: (cfg) => {
+			let steps = [];
+			if (cfg.ml352_hotswap === true)
+				push(steps, { check: 'AT+HOSCFG?', want: '^\\+HOSCFG:\\s*1\\s*,\\s*1\\s*$',
+					set: 'AT+HOSCFG=1,1', note: 'ML352 SIM detect (active high)', reset: true });
+			if (cfg.ml352_auto_dial === true)
+				push(steps, { check: 'AT+DIALMODE?', want: '^\\+DIALMODE:\\s*0\\s*$',
+					set: 'AT+DIALMODE=0', note: 'ML352 automatic RNDIS dial' });
+			return steps;
+		},
+		// Preserve all documented masks/preferences, changing only field 6.
+		// The ninth read-only field from *BAND? must not be sent to *BAND=.
+		// Failure is returned to the caller, not hidden behind a guessed mask.
+		configure_roaming: (modem, cb) => {
+			let want = modem.config.ml352_roaming;
+			if (want == null)
+				return cb(null, false);
+
+			modem.at.send('AT*BAND?', (err, res) => {
+				if (err)
+					return cb(err);
+
+				for (let l in (res?.lines ?? [])) {
+					let m = match(l, /^\*BAND:\s*([0-9]+(\s*,\s*[0-9]+){7,8})\s*$/);
+					if (!m)
+						continue;
+
+					let fields = split(replace(m[1], /\s/g, ''), ',');
+					let requested = want ? '1' : '0';
+					if (fields[5] == requested)
+						return cb(null, false);
+
+					fields[5] = requested;
+					modem.at.send('AT*BAND=' + join(',', slice(fields, 0, 8)), (e) => {
+						if (e)
+							return cb(e);
+						modem.at.send('AT*BAND?', (e2, r2) => {
+							if (e2)
+								return cb(e2);
+							let verified = false;
+							for (let line in (r2?.lines ?? [])) {
+								let vm = match(line, /^\*BAND:\s*([0-9]+(\s*,\s*[0-9]+){7,8})\s*$/);
+								if (vm && split(replace(vm[1], /\s/g, ''), ',')[5] == requested)
+									verified = true;
+							}
+							cb(verified ? null : { error: 'ml352_roaming_unverified' }, verified);
+						});
+					});
+					return;
+				}
+
+				cb({ error: 'ml352_band_unreadable' });
+			});
+		},
+		// HOSCFG makes SIM hot-swap a modem function. While waiting for
+		// registration, an ICCID read at most once per minute tells us when
+		// the SIM is explicitly absent; a transient serial error must not
+		// erase a previously confirmed card. Only the boolean is returned.
+		sim_presence: (modem, cb) => {
+			let now = time();
+			if (now - (modem._ml352_sim_polled_at ?? 0) < 60)
+				return cb(null);
+			modem._ml352_sim_polled_at = now;
+			modem.at.send('AT+ICCID', (err, res) => {
+				if (err?.error == 'cme' && (+err.code == 10 || +err.code == 310))
+					return cb(false);
+				if (err)
+					return cb(null);
+
+				for (let l in (res?.lines ?? []))
+					if (match(l, /^\+ICCID:\s*"?[0-9a-fA-F]{18,22}"?\s*$/))
+						return cb(true);
+				cb(null);
+			}, { timeout: 8000 });
+		},
+		auth_cmd: null,   // no ML352 authentication command established locally
+		dials: [ DIAL_ML352_NETACT, DIAL_CGACT ],
+		stats: null,
+		parse_stats: () => null,
+		// CGPADDR is the authoritative assigned address for this IPv4 CID.
+		// CGCONTRDP reports the same address and the carrier's DNS servers but
+		// leaves its gateway empty. wwand sets NOARP on this RNDIS netdev, so
+		// its existing /32 + device-default route works without a DHCP child;
+		// discarding CGCONTRDP's DNS would leave that standard path unresolved.
+		// Never use DNS from a stale CGCONTRDP response for a different PDP IP.
+		ip_config: (modem, cid, cfg, cb) => {
+			if (cid != 1 || cfg.pdp_type != 'ipv4')
+				return cb('ML352 address source established only for IPv4 CID 1');
+
+			modem.at.send('AT+CGPADDR=1', (err, res) => {
+				if (err)
+					return cb(err);
+
+				for (let l in (res?.lines ?? [])) {
+					let m = match(l, /^\+CGPADDR:\s*1\s*,\s*"?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"?\s*$/);
+
+					if (!m)
+						continue;
+
+					let valid = (m[1] != '0.0.0.0');
+					for (let n in split(m[1], '.'))
+						if (+n > 255)
+							valid = false;
+
+					if (!valid)
+						continue;
+
+					let addr = m[1];
+					let engine = modem.at;
+					if (!engine)
+						return cb({ error: 'modem_gone' });
+
+					return engine.send('AT+CGCONTRDP=1', (detail_err, detail_res) => {
+						let rdp = !detail_err ? parse_cgcontrdp(detail_res?.lines)?.ipv4 : null;
+						let dns = rdp?.addr == addr ? (rdp.dns ?? []) : [];
+						cb(null, { ipv4: { addr: addr, prefix: null,
+							gateway: null, dns: dns, mtu: null }, ipv6: null });
+					}, { timeout: 8000 });
+				}
+
+				cb('ML352 CID 1 has no assigned IPv4 address');
+			}, { timeout: 8000 });
+		},
+	},
+
 	// MeiG Smart SLM7xx / SLM8xx (ASR platform). Its own dial + auth commands
 	// (verified against the SLM770A AT manual — NOT Quectel-compatible):
 	//   AT^AUTHDATA=<cid>,<auth>,<PLMN>,<password>,<username>   (auth 0/1/2)
@@ -1898,6 +2054,9 @@ const MODEL_VENDORS = [
 	[ /^(le9|ln9|lm9|fn9|he9)/, 'telit' ],
 	[ /^sim[0-9]/, 'simcom' ],
 	[ /^(em7|em9|mc7|rc7|em06|wp7)/, 'sierra' ],
+	// ML352 is ASR, not ZTE: keep the narrower family ahead of the legacy
+	// ml* fallback even when AT+CGMI is absent (local ml352d/ml352d).
+	[ /^ml352([^0-9]|$)/, 'ml352' ],
 	[ /^(ml[0-9]|mf[0-9])/, 'zte' ],
 ];
 
@@ -1918,6 +2077,15 @@ export const USB_IDENTITY = {
 export function vendor_for(manufacturer, model)
 {
 	let s = lc(manufacturer ?? '');
+	let m = lc(model ?? '');
+
+	// The ML352's ASR USB VID is historically associated with Marvell.
+	// Even when CGMI uses that name, its exact model must not inherit the
+	// unrelated ZTE/Marvell ZGACT recipe. A real ZTE manufacturer still
+	// takes precedence over the model fallback.
+	if (match(m, /^ml352([^0-9]|$)/) &&
+	    (s == '' || match(s, /asr|marvell/)))
+		return VENDORS.ml352;
 
 	// fibocom FIRST: the FM350 family is a MediaTek T700 module, and units
 	// whose CGMI reports the die vendor ("MediaTek") instead of the brand
@@ -1930,8 +2098,6 @@ export function vendor_for(manufacturer, model)
 		for (let name, v in VENDORS)
 			if (v.match && match(s, v.match))
 				return v;
-
-	let m = lc(model ?? '');
 
 	if (m != '')
 		for (let e in MODEL_VENDORS)
@@ -2101,4 +2267,5 @@ VENDORS.quectel.telemetry = telemetry_ncm.QUECTEL;
 VENDORS.meig.telemetry    = telemetry_ncm.MEIG;
 VENDORS.huawei.telemetry  = telemetry_ncm.HUAWEI;
 VENDORS.fibocom.telemetry = telemetry_ncm.FIBOCOM;
+VENDORS.ml352.telemetry  = telemetry_ncm.ML352;
 VENDORS.generic.telemetry = telemetry_ncm.GENERIC;

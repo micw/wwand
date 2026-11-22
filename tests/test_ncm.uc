@@ -24,6 +24,61 @@ import * as telemetry_ncm from 'wwand/telemetry_ncm.uc';
 
 uloop.init();
 
+let ml_dial = ncm_vendors.VENDORS.ml352?.dials[0];
+eq(ml_dial?.probe, 'AT*NETACT=?', 'ML352 verifies *NETACT capability');
+eq(ml_dial?.pre_connect(1), 'AT+CGACT=1,1', 'ML352 activates CID before binding RNDIS');
+eq(ml_dial?.pre_connect_status, true, 'ML352 alone reads PDP state before CGACT');
+eq(ml_dial?.connect(1), 'AT*NETACT=1,1,1', 'ML352 binds RNDIS after PDP activation');
+eq(ml_dial?.disconnect(1), 'AT*NETACT=0,1,1', 'ML352 explicitly unbinds RNDIS');
+eq(ml_dial?.status_is_binding, false, 'CGACT does not prove ML352 RNDIS binding');
+
+// ML352 engineering reads preserve the prior mode even when EEMGINFO times
+// out. The parser uses the real ML352_AFL-V1 field layout, not Air720's
+// diverging trailing SVC fields or an unverified PLMN in field one.
+let ml_eem = [
+	'+EEMLTESVC: 610, 2, 1, 16545, 312, 3050, 21050, 7, 5, 44, 14, 18, 2, 10, 0, 0, 0, 65331, 112, 4136571234, 35727619, 255',
+	'+EEMLTEINTER: 0, 197, 1444, 57, 24',
+	'+EEMLTEINTRA: 0, 313, 3050, 32, 0',
+	'+EEMGINFO : 3, 2',
+];
+let ml_commands = [];
+let ml_prior = 2, ml_query_error = false;
+let ml_telemetry = { reg: { registration: 1 }, signal: {},
+	at_telemetry: { send: (cmd, cb) => {
+		push(ml_commands, cmd);
+		if (cmd == 'AT+EEMOPT?') return cb(null, { lines: [ sprintf('+EEMOPT: %d%s', ml_prior, ml_prior == 2 ? ',15' : '') ] });
+		if (cmd == 'AT+EEMGINFO?' && ml_query_error) return cb({ error: 'timeout' });
+		return cb(null, { lines: cmd == 'AT+EEMGINFO?' ? ml_eem :
+			cmd == 'AT*BANDIND?' ? [ '*BANDIND: 0,7,7' ] : [] });
+	} },
+};
+telemetry_ncm.ML352.cells(ml_telemetry, () => {
+	eq(ml_commands, [ 'AT*BANDIND?', 'AT+EEMOPT?', 'AT+EEMOPT=1',
+		'AT+EEMGINFO?', 'AT+EEMOPT=2,15' ], 'ML352 EEM read temporarily enters query mode then restores prior mode');
+	eq(ml_telemetry.cells?.serving?.lte?.pci, 312, 'ML352 EEM serving PCI');
+	eq(ml_telemetry.cells?.serving?.lte?.earfcn, 3050, 'ML352 EEM serving EARFCN');
+	eq(ml_telemetry.cells?.serving?.lte?.band, 7, 'ML352 EEM serving band');
+	eq(ml_telemetry.cells?.serving?.lte?.rsrp_index, 44, 'ML352 raw serving RSRP index');
+	eq(ml_telemetry.cells?.serving?.lte?.rsrq_index, 14, 'ML352 raw serving RSRQ index');
+	eq(ml_telemetry.signal?.lte?.rsrp, null, 'ML352 does not imply unverified index is dBm');
+	eq(ml_telemetry.cells?.lte_intra?.cells[1]?.pci, 313, 'ML352 LTEINTRA neighbour');
+	eq(ml_telemetry.cells?.lte_inter?.freqs[0]?.earfcn, 1444, 'ML352 LTEINTER frequency');
+	eq(ml_telemetry.reg.band, 7, 'ML352 BANDIND raw band');
+});
+ml_commands = []; ml_query_error = true;
+telemetry_ncm.ML352.cells(ml_telemetry, () => {
+	eq(ml_commands, [ 'AT*BANDIND?', 'AT+EEMOPT?', 'AT+EEMOPT=1',
+		'AT+EEMGINFO?', 'AT+EEMOPT=2,15' ], 'ML352 EEM timeout still restores prior mode');
+	eq(ml_telemetry.cells?.serving?.lte?.band, 7,
+		'ML352 failed EEM query preserves prior serving band');
+});
+ml_commands = []; ml_prior = 1;
+telemetry_ncm.ML352.cells(ml_telemetry, () => {
+	eq(ml_commands, [ 'AT*BANDIND?', 'AT+EEMOPT?', 'AT+EEMGINFO?' ],
+		'ML352 already-query mode never writes EEMOPT');
+});
+
+
 // --- scripted AT transport ---------------------------------------------------
 //
 // handlers: [ { re, lines?, term? } ]  (first match wins). term defaults to
@@ -1362,6 +1417,54 @@ push(scenarios, {
 		});
 	},
 });
+
+// CGACT? confirms only the PDP, not the RNDIS binding. ML352_AFL-V1
+// (field-observed 2026-11-22) returns CME when CGACT=1 repeats an already
+// active PDP; a successful read must skip that write but still bind via NETACT.
+// On an inactive or unreadable PDP, retain the original CGACT -> NETACT path.
+for (let state in [ 'inactive', 'active', 'query_error' ]) {
+	let already_active = state == 'active';
+	let query_error = state == 'query_error';
+	push(scenarios, {
+		name: 'ml352_netact_' + state,
+		script: [
+			{ re: /^ATI$/, lines: [ 'Manufacturer: ML352', 'Model: ML352_AFL', 'Revision: ML352_AFL-V1 [Sep 25 2020 13:33:13]' ] },
+			{ re: /^AT\+CGMI$/, lines: [ 'ML352' ] },
+			{ re: /^AT\+CGMM$/, lines: [ 'ML352_AFL' ] },
+			{ re: /^AT\+CGMR$/, lines: [ 'ML352_AFL-V1 [Sep 25 2020 13:33:13]' ] },
+			{ re: /^AT\+CPIN\?$/, lines: [ '+CPIN: READY' ] },
+			{ re: /^AT\+CEREG\?$/, lines: [ '+CEREG: 2,1' ] },
+			{ re: /^AT\*NETACT=\?$/, lines: [ '*NETACT: (0,1),(1),(1)' ] },
+			{ re: /^AT\+CGDCONT\?$/, lines: [ '+CGDCONT: 1,"IP",""' ] },
+			{ re: /^AT\+CGACT\?$/, term: query_error ? 'ERROR' : 'OK',
+				lines: query_error ? [] : [ sprintf('+CGACT: 1,%d', already_active ? 1 : 0) ] },
+			{ re: /^AT\+CGACT=1,1$/, term: already_active ? '+CME ERROR: 3' : 'OK' },
+			{ re: /^AT\*NETACT=1,1,1$/, lines: [] },
+			{ re: /^AT\*NETACT=0,1,1$/, lines: [] },
+			{ re: /^AT\+CGPADDR=1$/, lines: [ '+CGPADDR: 1,"10.199.103.90"' ] },
+			{ re: /^AT\+CGCONTRDP=1$/, lines: [ '+CGCONTRDP: 1,5,"example","10.199.103.90","","10.74.210.210","10.74.210.211"' ] },
+		],
+		cconfig: { apn: '', pdp_type: 'ipv4' },
+		run: (env) => env.ctx.up((err) => {
+			eq(err, null, 'ML352 ' + state + ': RNDIS context connects');
+			let commands = env.tr.written;
+			let query = index(commands, 'AT+CGACT?');
+			let pdp = index(commands, 'AT+CGACT=1,1');
+			let bind = index(commands, 'AT*NETACT=1,1,1');
+			ok(query >= 0 && bind > query, 'ML352 ' + state + ': PDP state read precedes NETACT');
+			if (already_active)
+				eq(pdp, -1, 'ML352 active PDP skips the CME-producing CGACT write');
+			else
+				ok(pdp > query && bind > pdp, 'ML352 ' + state + ': CGACT precedes NETACT');
+			eq(env.ctx.settings?.ipv4?.dns, [ '10.74.210.210', '10.74.210.211' ],
+				'ML352 ' + state + ': supplies carrier DNS');
+			env.ctx.down(() => {
+				ok(env.tr.saw(/^AT\*NETACT=0,1,1$/) != null, 'ML352 ' + state + ': unbinds RNDIS');
+				env.finish();
+			});
+		}),
+	});
+}
 
 // --- s7: Quectel telemetry -> QMI self.cells / self.signal / reg_detail ------
 //

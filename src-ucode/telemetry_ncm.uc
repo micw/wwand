@@ -141,8 +141,14 @@ function group_inter(list)
 			push(order, k);
 		}
 
-		push(byf[k].cells, { pci: c.pci, rsrp: c.rsrp, rsrq: c.rsrq,
-		                     rssi: c.rssi, srxlev: c.srxlev });
+		let cell = { pci: c.pci, rsrp: c.rsrp, rsrq: c.rsrq,
+		             rssi: c.rssi, srxlev: c.srxlev };
+		if (c.metric_encoding) {
+			cell.rsrp_index = c.rsrp_index;
+			cell.rsrq_index = c.rsrq_index;
+			cell.metric_encoding = c.metric_encoding;
+		}
+		push(byf[k].cells, cell);
 	}
 
 	if (!length(order))
@@ -1128,6 +1134,103 @@ const TELEMETRY_FIBOCOM = {
 	ca: tel_noop, reg_detail: tel_ceer_reg_detail,
 	// HW-validated on a WH3000 Pro + FM350-GL (GTCAINFO PCC/SCC +
 	// GTCCINFO enrichment, field offsets cross-checked live)
+};
+
+// SYSINFO's fourth field is 9 on LTE and 5 on UMTS in the LT22M stock
+// modem library (offline analysis, 2026-09). An unknown value is not GSM.
+function tel_ml352_signal(self, cb)
+{
+	csq_first(self, () => {
+		modem_common.telemetry_at(self).send('AT^SYSINFO', (err, res) => {
+			if (!err)
+				for (let l in (res?.lines ?? [])) {
+					let m = match(l, /^\^SYSINFO:\s*[0-9]+\s*,\s*[0-9]+\s*,\s*[0-9]+\s*,\s*([0-9]+)/);
+					if (!m)
+						continue;
+					let tech = (+m[1] == 9) ? 'lte' : (+m[1] == 5) ? 'umts' : null;
+					if (self.reg)
+						self.reg.tech = tech;
+					self.rat_label = tech ? uc(tech) : null;
+					break;
+				}
+			cb();
+		});
+	});
+}
+
+// A failed EEM query must still restore the mode read before it. The AT
+// engine's per-command timeout bounds each hop; there is no unsolicited
+// engineering stream because we request mode 1, never periodic mode 2.
+function tel_ml352_cells(self, cb)
+{
+	let at = modem_common.telemetry_at(self);
+	at.send('AT*BANDIND?', (err, res) => {
+		if (!err && self.reg)
+			for (let l in (res?.lines ?? [])) {
+				let m = match(l, /^\*BANDIND:\s*[0-9]+\s*,\s*([0-9]+)/);
+				if (m) { self.reg.band = +m[1]; break; }
+			}
+		at.send('AT+EEMOPT?', (e0, r0) => {
+			let mode = null, restore_cmd = null;
+			if (!e0)
+				for (let l in (r0?.lines ?? [])) {
+					// The target ucode uses POSIX ERE, without non-capturing (?:).
+					let m = match(l, /^\+EEMOPT:\s*([012])(\s*,\s*([0-9]+))?\s*$/);
+					if (!m || (m[1] == '2' && !m[3]))
+						continue;
+					mode = +m[1];
+					restore_cmd = sprintf('AT+EEMOPT=%s%s', m[1], m[3] ? ',' + m[3] : '');
+					break;
+				}
+			// An unknown prior mode is not permission to change persistent modem
+			// state: the restore target would be unknowable.
+			if (mode == null)
+				return cb();
+			let restore = (done) => {
+				if (mode == 1)
+					return done();
+				let channel = self.at_telemetry ?? self.at;
+				if (!channel) {
+					if (self.log_fn)
+						self.log_fn('error', 'ML352 EEM mode restore failed; operator intervention required');
+					return done();
+				}
+				channel.send(restore_cmd, (er) => {
+					if (er && self.at && self.at != channel)
+						return self.at.send(restore_cmd, (fallback_err) => {
+							if (fallback_err && self.log_fn)
+								self.log_fn('error', 'ML352 EEM mode restore failed; operator intervention required');
+							done();
+						}, { timeout: 3000 });
+					if (er && self.log_fn)
+						self.log_fn('error', 'ML352 EEM mode restore failed; operator intervention required');
+					done();
+				}, { timeout: 3000 });
+			};
+			let query = () => at.send('AT+EEMGINFO?', (eq, rq) => {
+				if (!eq) {
+					let parsed = atcmd.parse_ml352_eemginfo(rq?.lines);
+					if (parsed)
+						assemble_cells(self, parsed.serving, parsed.neigh, null, true);
+				}
+				restore(cb);
+			}, { timeout: 5000 });
+			if (mode == 1)
+				return query();
+			at.send('AT+EEMOPT=1', (es) => {
+				// Even an AT error may follow an accepted write: restore the old
+				// mode before completing this telemetry tick.
+				if (!es)
+					return query();
+				restore(cb);
+			}, { timeout: 3000 });
+		}, { timeout: 3000 });
+	});
+}
+
+export const ML352 = {
+	signal: tel_ml352_signal, cells: tel_ml352_cells,
+	ca: tel_noop, reg_detail: tel_ceer_reg_detail,
 };
 
 const TELEMETRY_GENERIC = {

@@ -308,4 +308,17 @@ let at_cmds = (at) => filter(at.sent, (c) => index(c, ',') >= 0);
 	eq(length(at_cmds(at)), 0, 'none: and no QNWLOCK write follows a bare OK');
 }
 
+// ML352_AFL-V1 answers AT*CELL? with CME unsupported (LT22M hardware,
+// 2026-11-17): do not guess an unlocked state or issue a write-only lock.
+{
+	let at = fake_at({ 'AT+QNWLOCK="common/4g"': 'ERROR', 'AT*CELL?': 'ERROR' });
+	let m = { at: at, config: { lock_4g: '3050:312' } };
+	let w = run(m);
+	eq(m.cell_lock_dialect, null, 'ML352: no readable lock dialect selected');
+	eq(at.sent, [ 'AT+QNWLOCK="common/4g"' ],
+		'ML352: no AT*CELL writes or unsupported readback attempted');
+	eq(map(w, (x) => x.check), [ 'lock_4g' ],
+		'ML352: configured lock is explicitly reported as unapplied');
+}
+
 done('test_cell_lock');
