@@ -245,6 +245,8 @@ function run_next()
 						deps: {
 							log: () => null,
 							on_event: (c, ev, d) => push(cevents, { event: ev, data: d }),
+							dhcp_spawn: s.dhcp_spawn ?? (() => { ok(false, 'unexpected DHCP process: ' + s.name); return null; }),
+							dhcp_kill: s.dhcp_kill,
 						},
 					});
 
@@ -1422,9 +1424,11 @@ push(scenarios, {
 // (field-observed 2026-11-22) returns CME when CGACT=1 repeats an already
 // active PDP; a successful read must skip that write but still bind via NETACT.
 // On an inactive or unreadable PDP, retain the original CGACT -> NETACT path.
-for (let state in [ 'inactive', 'active', 'query_error' ]) {
+for (let state in [ 'inactive', 'active', 'query_error', 'no_ack', 'spawn_failure', 'timeout', 'cancel' ]) {
 	let already_active = state == 'active';
 	let query_error = state == 'query_error';
+	let exit_cb = null, starts = 0, kills = 0;
+	let failure = state == 'no_ack' || state == 'spawn_failure' || state == 'timeout';
 	push(scenarios, {
 		name: 'ml352_netact_' + state,
 		script: [
@@ -1445,24 +1449,83 @@ for (let state in [ 'inactive', 'active', 'query_error' ]) {
 			{ re: /^AT\+CGCONTRDP=1$/, lines: [ '+CGCONTRDP: 1,5,"example","10.199.103.90","","10.74.210.210","10.74.210.211"' ] },
 		],
 		cconfig: { apn: '', pdp_type: 'ipv4' },
-		run: (env) => env.ctx.up((err) => {
-			eq(err, null, 'ML352 ' + state + ': RNDIS context connects');
-			let commands = env.tr.written;
-			let query = index(commands, 'AT+CGACT?');
-			let pdp = index(commands, 'AT+CGACT=1,1');
-			let bind = index(commands, 'AT*NETACT=1,1,1');
-			ok(query >= 0 && bind > query, 'ML352 ' + state + ': PDP state read precedes NETACT');
-			if (already_active)
-				eq(pdp, -1, 'ML352 active PDP skips the CME-producing CGACT write');
-			else
-				ok(pdp > query && bind > pdp, 'ML352 ' + state + ': CGACT precedes NETACT');
-			eq(env.ctx.settings?.ipv4?.dns, [ '10.74.210.210', '10.74.210.211' ],
-				'ML352 ' + state + ': supplies carrier DNS');
-			env.ctx.down(() => {
-				ok(env.tr.saw(/^AT\*NETACT=0,1,1$/) != null, 'ML352 ' + state + ': unbinds RNDIS');
-				env.finish();
+		datapath: { netdev: 'wwand0' },
+		ctx_timing: { dhcp_timeout: state == 'timeout' ? 20 : 1000 },
+		dhcp_spawn: (path, argv, env, cb) => {
+			starts++;
+			eq(path, '/sbin/udhcpc', 'ML352 uses BusyBox DHCP client');
+			eq(argv, [ '-i', 'wwand0', '-n', '-q', '-t', '4', '-T', '4', '-s', '/bin/true' ],
+				'ML352 sends DHCP without applying or releasing the lease');
+			if (state == 'spawn_failure')
+				return null;
+			exit_cb = cb;
+			return { pid: () => 1234 };
+		},
+		dhcp_kill: (pid) => {
+			eq(pid, 1234, 'terminates the pending DHCP client');
+			kills++;
+		},
+		run: (env) => {
+			let check_order = () => {
+				let commands = env.tr.written;
+				let query = index(commands, 'AT+CGACT?');
+				let pdp = index(commands, 'AT+CGACT=1,1');
+				let bind = index(commands, 'AT*NETACT=1,1,1');
+				ok(query >= 0 && bind > query, 'ML352 ' + state + ': PDP state read precedes NETACT');
+				if (already_active)
+					eq(pdp, -1, 'ML352 active PDP skips the CME-producing CGACT write');
+				else
+					ok(pdp > query && bind > pdp, 'ML352 ' + state + ': CGACT precedes NETACT');
+				ok(index(commands, 'AT+CGPADDR=1') > bind, 'ML352 reads the static IP after binding');
+			};
+			env.ctx.up((err) => {
+				check_order();
+				eq(starts, 1, 'one DHCP client per activation');
+				if (state == 'cancel') {
+					eq(err?.error, 'activation_cancelled', 'down completes the pending activation with cancellation');
+					return;
+				}
+				if (failure) {
+					eq(err?.stage, 'dhcp_handshake', 'ML352 ' + state + ': DHCP failure attributed to its stage');
+					eq(env.ctx.status().last_error?.stage, 'dhcp_handshake', 'DHCP failure visible in context status');
+					eq(env.ctx.state, 'IDLE', 'failed handshake does not leave a connected context');
+					eq(env.ctx.settings, null, 'failed handshake does not publish settings');
+					ok(!last_event(env.cevents, 'up'), 'failed handshake never emits up');
+					ok(env.tr.saw(/^AT\*NETACT=0,1,1$/) != null, 'failed handshake unbinds RNDIS');
+					eq(kills, state == 'timeout' ? 1 : 0, 'only a live timed-out child needs termination');
+					env.finish();
+					return;
+				}
+				eq(err, null, 'ML352 ' + state + ': RNDIS context connects after ACK');
+				eq(env.ctx.settings?.ipv4?.addr, '10.199.103.90', 'ML352 keeps the AT-assigned address');
+				eq(env.ctx.settings?.ipv4?.dns, [ '10.74.210.210', '10.74.210.211' ], 'ML352 keeps the AT-reported DNS');
+				env.ctx.down(() => {
+					ok(env.tr.saw(/^AT\*NETACT=0,1,1$/) != null, 'ML352 ' + state + ': unbinds RNDIS');
+					env.finish();
+				});
 			});
-		}),
+
+			if (state == 'spawn_failure')
+				return;
+
+			wait_for(() => exit_cb != null, () => {
+				check_order();
+				eq(env.ctx.state, 'ACTIVATING', 'ML352 waits for ACK before marking connected');
+				eq(env.ctx.settings, null, 'ML352 does not publish AT settings before ACK');
+				ok(!last_event(env.cevents, 'up'), 'no up event before ACK');
+				if (state == 'timeout')
+					return;
+				if (state == 'cancel')
+					return env.ctx.down(() => {
+						eq(kills, 1, 'down cancels the active DHCP process');
+						exit_cb(0);
+						eq(env.ctx.state, 'IDLE', 'stale ACK cannot establish a canceled context');
+						ok(!last_event(env.cevents, 'up'), 'stale ACK does not publish up');
+						env.finish();
+					});
+				exit_cb(state == 'no_ack' ? 1 : 0);
+			});
+		},
 	});
 }
 

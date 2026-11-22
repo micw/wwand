@@ -52,6 +52,50 @@ export function create(opts)
 	let log = deps.log ?? ((l, m) => warn(sprintf('%s: interface %s: %s\n', l, self.name, m)));
 	let up_cb = null;
 	let activated = false;   // our dial bound the netdev — down() must unbind it
+	let dhcp = null;
+	let spawn = deps.dhcp_spawn ?? uloop.process;
+	let kill_dhcp = deps.dhcp_kill ?? ((pid) => system(['/bin/busybox', 'kill', '-KILL', '' + pid]));
+
+	let cancel_dhcp = () => {
+		if (!dhcp)
+			return;
+		let run = dhcp;
+		dhcp = null;
+		run.timer.cancel();
+		// Leave the uloop waiter installed to reap the child. Its callback
+		// checks the run identity, so cancellation cannot complete a new dial.
+		kill_dhcp(run.proc.pid());
+	};
+	self.cancel_pending_activation = cancel_dhcp;
+
+	let dhcp_handshake = (done) => {
+		let dev = self.modem.datapath?.netdev;
+		if (!dev)
+			return done('ML352 DHCP handshake has no data interface');
+
+		// ML352_AFL-V1 (LT22M, field observation 2026-11-22): *NETACT
+		// and valid AT settings do not start forwarding after reset until a
+		// DHCP ACK. Do not use the lease to configure the host, or release
+		// it on quit: AT + netifd still own the addresses and routes.
+		let run = {};
+		run.proc = spawn('/sbin/udhcpc', ['-i', dev, '-n', '-q', '-t', '4', '-T', '4', '-s', '/bin/true'], null, (code) => {
+			if (dhcp !== run)
+				return;
+			dhcp = null;
+			run.timer.cancel();
+			done(code === 0 ? null : sprintf('ML352 DHCP handshake failed (udhcpc exit %d)', code));
+		});
+		if (!run.proc)
+			return done('could not start udhcpc for ML352 DHCP handshake');
+
+		dhcp = run;
+		// -n bounds discovery, but a NAK resets its attempt counter
+		// (BusyBox 1.38.0 dhcpc.c). Bound the whole activation step as well.
+		run.timer = uloop.timer(opts.timing?.dhcp_timeout ?? 35000, () => {
+			cancel_dhcp();
+			done('ML352 DHCP handshake timed out');
+		});
+	};
 
 	// zero-rx watchdog + bearer-liveness poll (parity with the QMI/MBIM
 	// contexts): while CONNECTED, sample the vendor byte counters and netdev
@@ -309,6 +353,7 @@ export function create(opts)
 	};
 
 	stop_stats = () => {
+		cancel_dhcp();
 		// every teardown path funnels through here, so a pending ^DEND
 		// verification cannot outlive the session it was asking about
 		clear_session_confirm();
@@ -359,7 +404,7 @@ export function create(opts)
 	// than asking the question again.
 	let read_rdp_once = (cb) => {
 		// THE VENDOR BRANCH NEEDS THE SAME GUARD. It dereferences modem.at
-		// itself (ncm_vendors.uc:1575, :1666 and friends) instead of going
+		// itself (ncm_vendors.uc:1576, :1666 and friends) instead of going
 		// through at_send, and the NCM teardown nulls modem.at without
 		// notifying the contexts — so an ACTIVATING context whose retry fires a
 		// second later used to call `.send` on null. A throw inside a uloop
@@ -763,54 +808,70 @@ export function create(opts)
 						if (e2)
 							return self._fail({ stage: 'ip_config', err: e2 });
 
-						self.settings = build_settings(rdp);
+						let settings = build_settings(rdp);
 
 						// an ipv6-only PDP legitimately carries no static address
 						// (host v6 = the modem's RA/SLAAC, host v4 = the separate
 						// 464xlat package) — only a v4-capable PDP with empty
 						// settings is an error
-						if ((!self.settings.ipv4 && !self.settings.ipv6) &&
+						if ((!settings.ipv4 && !settings.ipv6) &&
 						    ccfg.pdp_type != 'ipv6')
 							return self._fail({ stage: 'ip_config', err: 'no address assigned' });
 
-						if (self.settings.ipv4)
-							log('notice', sprintf('ipv4 config: %s/%d gw %s dns [%s] mtu %J',
-								self.settings.ipv4.addr, self.settings.ipv4.prefix,
-								self.settings.ipv4.gateway ?? '-', join(' ', self.settings.ipv4.dns),
-								self.settings.ipv4.mtu));
+						let at = self.modem.at;
+						let finish = (err) => {
+							if (self.state != 'ACTIVATING')
+								return;
+							if (!at || self.modem.at !== at)
+								return self._fail({ stage: 'ip_config', err: { error: 'modem_gone' } });
+							if (err)
+								return self._fail({ stage: 'dhcp_handshake', error: err });
 
-						if (self.settings.ipv6?.addr)
-							log('notice', sprintf('ipv6 config: %s/%d gw %s dns [%s]',
-								self.settings.ipv6.addr, self.settings.ipv6.plen,
-								self.settings.ipv6.gateway ?? '-', join(' ', self.settings.ipv6.dns)));
-						// NOT "ipv6-only": this branch is about the v6 half alone and
-						// says nothing about v4, which was logged above if present.
-						// The old wording claimed the PDP was v6-only even on a
-						// dual-stack context that had just printed its v4 address
-						// one line earlier, and a reporter read it as the cause of a
-						// missing v4 address (ddimension/wwand#32) — it never was.
-						else if (self.settings.ipv6)
-							log('notice', sprintf('ipv6 dns: [%s] (no static v6 address — host v6 via RA/SLAAC)',
-								join(' ', self.settings.ipv6.dns)));
+							self.settings = settings;
+							if (self.settings.ipv4)
+								log('notice', sprintf('ipv4 config: %s/%d gw %s dns [%s] mtu %J',
+									self.settings.ipv4.addr, self.settings.ipv4.prefix,
+									self.settings.ipv4.gateway ?? '-', join(' ', self.settings.ipv4.dns),
+									self.settings.ipv4.mtu));
 
-						if (!self.settings.ipv4 && !self.settings.ipv6)
-							log('notice', 'ip config: none (ipv6-only PDP — host v6 via RA/SLAAC, host v4 via 464xlat)');
+							if (self.settings.ipv6?.addr)
+								log('notice', sprintf('ipv6 config: %s/%d gw %s dns [%s]',
+									self.settings.ipv6.addr, self.settings.ipv6.plen,
+									self.settings.ipv6.gateway ?? '-', join(' ', self.settings.ipv6.dns)));
+							// NOT "ipv6-only": this branch is about the v6 half alone and
+							// says nothing about v4, which was logged above if present.
+							// The old wording claimed the PDP was v6-only even on a
+							// dual-stack context that had just printed its v4 address
+							// one line earlier, and a reporter read it as the cause of a
+							// missing v4 address (ddimension/wwand#32) — it never was.
+							else if (self.settings.ipv6)
+								log('notice', sprintf('ipv6 dns: [%s] (no static v6 address — host v6 via RA/SLAAC)',
+									join(' ', self.settings.ipv6.dns)));
 
-						self.last_error = null;   // a good connection clears the last failure
-						set_state('CONNECTED');
-						start_stats();
-						emit('up', self.settings);
+							if (!self.settings.ipv4 && !self.settings.ipv6)
+								log('notice', 'ip config: none (ipv6-only PDP — host v6 via RA/SLAAC, host v4 via 464xlat)');
 
-						// a delegated prefix is read on the settings refresh;
-						// ask once now rather than a stats interval later
-						if (context_common.pd_want(ccfg, context_common.effective_pdp(self)) == 1)
-							refresh_settings();
+							self.last_error = null;   // a good connection clears the last failure
+							set_state('CONNECTED');
+							start_stats();
+							emit('up', self.settings);
 
-						let cb2 = up_cb;
-						up_cb = null;
+							// a delegated prefix is read on the settings refresh;
+							// ask once now rather than a stats interval later
+							if (context_common.pd_want(ccfg, context_common.effective_pdp(self)) == 1)
+								refresh_settings();
 
-						if (cb2)
-							cb2(null, self.settings);
+							let cb2 = up_cb;
+							up_cb = null;
+
+							if (cb2)
+								cb2(null, self.settings);
+						};
+
+						if (dial.dhcp_handshake)
+							dhcp_handshake(finish);
+						else
+							finish(null);
 					}, { timeout: 15000 });
 				};
 
@@ -921,10 +982,15 @@ export function create(opts)
 	// is a stop the modem's detach follows (netsel_ops release_sessions)
 	self.down = function(cb, reason) {
 		let was = self.state;
+		let canceled_up = dhcp ? up_cb : null;
+		if (canceled_up)
+			up_cb = null;
 
 		stop_stats();
 		set_state('IDLE');
 		self.settings = null;
+		if (canceled_up)
+			canceled_up({ error: 'activation_cancelled' });
 
 		if (was == 'IDLE' || !self.modem.at || !activated) {
 			activated = false;
@@ -1074,6 +1140,7 @@ export function create(opts)
 			break;
 
 		case 'suspend':
+			cancel_dhcp();
 			// registration lost mid-attempt: abort an in-flight activation so
 			// the daemon requeues it (parity with context.uc)
 			if (self.state == 'ACTIVATING') {
@@ -1091,6 +1158,7 @@ export function create(opts)
 			break;
 
 		case 'sim_blocked':
+			cancel_dhcp();
 			if (up_cb) {
 				let cb = up_cb;
 				up_cb = null;

@@ -1557,7 +1557,7 @@ export function create(opts)
 	//     session that only down() will tear down.
 	//   - ACTIVATING is not "no session yet" either: MBIM sets `activated`
 	//     before it queries the IP configuration (context_mbim.uc:393-394), NCM
-	//     before it reads its own (context_ncm.uc:756), and QMI can have
+	//     before it reads its own (context_ncm.uc:801), and QMI can have
 	//     activated families while settings are still being fetched.
 	//
 	// Each backend's down() already knows exactly what it holds. Asking it is
@@ -1567,7 +1567,7 @@ export function create(opts)
 	//
 	// AND THE RECONNECT IS STARTED HERE, not inferred from the `down` event.
 	// context_ncm.down() returns WITHOUT emitting it when the activation has
-	// not set `activated` yet (context_ncm.uc:916-919) — so a mid-dial NCM
+	// not set `activated` yet (context_ncm.uc:977-980) — so a mid-dial NCM
 	// context would have gone IDLE with `wanted` still true and nothing
 	// scheduled, wedged by the very handler meant to restart it. enter_
 	// reconnecting returns on an armed hold timer, and every emitting backend
@@ -6251,6 +6251,7 @@ export function create(opts)
 		for (let name, entry in self.contexts) {
 			clear_reconnect(name);
 			cancel_confirm(entry);
+			entry.ctx?.cancel_pending_activation?.();
 		}
 
 		// a watchdog's pending repower fallback is the daemon's own too
