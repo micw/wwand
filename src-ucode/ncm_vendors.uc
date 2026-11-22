@@ -398,6 +398,7 @@ const DIAL_ML352_NETACT = {
 	status: DIAL_CGACT.status,
 	status_state: DIAL_CGACT.status_state,
 	status_is_binding: false, // CGACT? cannot confirm *NETACT bound RNDIS
+	dhcp_handshake: true,
 };
 
 // Quectel QNETDEVCTL (older/LTE Quectel; NOT the RG5xx/SDX 5G modems).
